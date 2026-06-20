@@ -41,6 +41,62 @@ DISRUPTION_URL       = "https://traffic-disruption.onrender.com/predict"
 TIMEOUT = 60.0   # seconds per downstream call
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EVENT CAUSE TAXONOMY  (derived from production event_cause value_counts)
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical reasons accepted from the client. Keys are normalized
+# (lowercase, spaces/slashes -> underscore) so "Fog / Low Visibility"
+# and "fog_low_visibility" both resolve correctly.
+EVENT_CAUSE_PLANNED_MAP = {
+    "vehicle_breakdown":   "unplanned",
+    "others":              "unplanned",
+    "pot_holes":           "unplanned",
+    "construction":        "planned",
+    "water_logging":       "unplanned",
+    "accident":            "unplanned",
+    "tree_fall":           "unplanned",
+    "road_conditions":     "unplanned",
+    "congestion":          "unplanned",
+    "public_event":        "planned",
+    "procession":          "planned",
+    "vip_movement":        "planned",
+    "protest":             "unplanned",
+    "debris":              "unplanned",
+    "test_demo":           "unplanned",
+    "fog_low_visibility":  "unplanned",
+}
+
+# event_cause options surfaced to API consumers / docs (human-readable form).
+VALID_EVENT_CAUSES = sorted(EVENT_CAUSE_PLANNED_MAP.keys())
+
+
+def _normalize_cause(raw: str) -> str:
+    return (
+        raw.strip()
+        .lower()
+        .replace("/", "_")
+        .replace("-", "_")
+        .replace(" ", "_")
+        .strip("_")
+    )
+
+
+def _resolve_event_cause(raw: str) -> tuple[str, str]:
+    """
+    Normalize a free-text/road_block_reason into a canonical event_cause
+    and resolve whether it's a planned or unplanned event.
+
+    Returns (canonical_event_cause, planned_status) where planned_status
+    is one of "planned" / "unplanned". Unrecognized reasons default to
+    "others" / "unplanned" rather than failing the request, since the
+    reason itself is still recorded verbatim downstream.
+    """
+    normalized = _normalize_cause(raw)
+    if normalized in EVENT_CAUSE_PLANNED_MAP:
+        return normalized, EVENT_CAUSE_PLANNED_MAP[normalized]
+    return "others", "unplanned"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -50,7 +106,7 @@ app = FastAPI(
         "and returns a single merged payload ready for the dashboard. "
         "Routing is independent — call the traffic routing API directly."
     ),
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -72,19 +128,14 @@ def _build_closure_payload(
     zone: str,
     corridor: str,
     junction: Optional[str],
+    event_cause: str,
+    event_type: str,
 ) -> dict:
     """Build the exact payload expected by road_closure /predict."""
     emergency = analysis.get("emergency", {})
-    scene     = emergency.get("scene_type", "unknown")
     em_level  = emergency.get("level", "LOW")
     veh_types = analysis.get("vehicle_types", {})
 
-    cause_map = {
-        "accident":  "accident",
-        "breakdown": "vehicle_breakdown",
-        "fire":      "others",
-        "flood":     "water_logging",
-    }
     priority_map = {"CRITICAL": "High", "HIGH": "High", "MEDIUM": "Low", "LOW": "Low"}
 
     dominant_veh = ""
@@ -99,11 +150,11 @@ def _build_closure_payload(
         "start_datetime": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+0000"),
         "latitude":       latitude,
         "longitude":      longitude,
-        "event_cause":    cause_map.get(scene, "others"),
+        "event_cause":    event_cause,
         "priority":       priority_map.get(em_level, "Low"),
         "zone":           zone,
         "corridor":       corridor,
-        "event_type":     "unplanned",
+        "event_type":     event_type,
         "veh_type":       dominant_veh,
         "junction":       junction,
     }
@@ -253,12 +304,166 @@ def _generate_recommendations(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# POLICE PERSONNEL REQUIREMENT MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+# Brackets are deliberately simple/explainable rather than a black-box model,
+# since dispatch decisions need to be auditable. Base headcount comes from
+# congestion severity, then emergency level + planned/unplanned status, and
+# scale (vehicles/people) act as escalators on top of the base bracket.
+
+_CONGESTION_BASE_BRACKETS = [
+    # (max_score_exclusive_upper_bound, bracket_label, base_personnel)
+    (0.25, "Light (2-3 personnel)",        2),
+    (0.50, "Moderate (3-5 personnel)",     3),
+    (0.70, "Heavy (5-8 personnel)",        5),
+    (0.85, "Severe (8-12 personnel)",      8),
+    (1.01, "Critical (12-20 personnel)",  12),
+]
+
+_EMERGENCY_LEVEL_BONUS = {
+    "LOW":      0,
+    "MEDIUM":   1,
+    "HIGH":     3,
+    "CRITICAL": 6,
+}
+
+# Above this many required personnel, a single beat/patrol unit isn't enough —
+# surface the nearest police station so dispatch can be raised to station level.
+POLICE_STATION_LOOKUP_THRESHOLD = 6
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+
+async def _find_nearest_police_station(
+    client: httpx.AsyncClient, lat: float, lon: float, radius_m: int = 8000
+) -> Optional[dict]:
+    """
+    Query OpenStreetMap's Overpass API for the nearest amenity=police node
+    within radius_m of (lat, lon). Returns None on failure or no results
+    rather than raising — this is a best-effort enrichment, not a hard
+    dependency of the response.
+    """
+    query = f"""
+    [out:json][timeout:10];
+    node["amenity"="police"](around:{radius_m},{lat},{lon});
+    out body;
+    """
+    try:
+        resp = await client.post(OVERPASS_URL, data={"data": query}, timeout=15.0)
+        resp.raise_for_status()
+        elements = resp.json().get("elements", [])
+    except Exception:
+        return None
+
+    if not elements:
+        return None
+
+    def _dist(el: dict) -> float:
+        # Equirectangular approximation — fine for short-range nearest-station ranking.
+        dlat = el["lat"] - lat
+        dlon = el["lon"] - lon
+        return (dlat * dlat) + (dlon * dlon)
+
+    nearest = min(elements, key=_dist)
+    tags = nearest.get("tags", {})
+    dlat = nearest["lat"] - lat
+    dlon = nearest["lon"] - lon
+    approx_km = round(((dlat * 111.0) ** 2 + (dlon * 111.0 * 0.96) ** 2) ** 0.5, 2)
+
+    return {
+        "name":           tags.get("name", "Unnamed Police Station"),
+        "latitude":       nearest["lat"],
+        "longitude":      nearest["lon"],
+        "approx_distance_km": approx_km,
+        "address":        ", ".join(
+            v for v in [
+                tags.get("addr:housenumber"),
+                tags.get("addr:street"),
+                tags.get("addr:suburb"),
+                tags.get("addr:city"),
+            ] if v
+        ) or None,
+        "phone":          tags.get("phone") or tags.get("contact:phone"),
+        "source":         "OpenStreetMap (Overpass API)",
+    }
+
+
+def _police_personnel_required(
+    congestion_score: float,
+    em_level: str,
+    event_type: str,
+    vehicles: int,
+    people: int,
+) -> dict:
+    """
+    Estimate how many traffic police personnel are needed to clear the
+    road block, and which dispatch bracket that falls into.
+    """
+    congestion_score = max(0.0, min(1.0, congestion_score))
+
+    base = _CONGESTION_BASE_BRACKETS[-1]
+    for upper, label, personnel in _CONGESTION_BASE_BRACKETS:
+        if congestion_score < upper:
+            base = (upper, label, personnel)
+            break
+
+    bracket_label, base_personnel = base[1], base[2]
+
+    emergency_bonus = _EMERGENCY_LEVEL_BONUS.get(em_level.upper(), 0)
+
+    # Unplanned events (accidents, breakdowns, debris, etc.) need faster,
+    # heavier response than planned ones (processions, VIP movement,
+    # scheduled construction) which are usually pre-staffed/coordinated.
+    planned_bonus = 0 if event_type == "planned" else 1
+
+    # Scale escalators: large vehicle pile-ups or crowds need more hands
+    # on deck regardless of the raw congestion score.
+    scale_bonus = 0
+    if vehicles > 10:
+        scale_bonus += 2
+    elif vehicles > 5:
+        scale_bonus += 1
+
+    if people > 20:
+        scale_bonus += 2
+    elif people > 10:
+        scale_bonus += 1
+
+    total_personnel = base_personnel + emergency_bonus + planned_bonus + scale_bonus
+    total_personnel = max(1, total_personnel)
+
+    # Re-derive the dispatch bracket label from the final total so it
+    # stays consistent even after bonuses push it past the base bracket.
+    if total_personnel <= 3:
+        final_bracket = "Light (2-3 personnel)"
+    elif total_personnel <= 5:
+        final_bracket = "Moderate (3-5 personnel)"
+    elif total_personnel <= 8:
+        final_bracket = "Heavy (5-8 personnel)"
+    elif total_personnel <= 12:
+        final_bracket = "Severe (8-12 personnel)"
+    else:
+        final_bracket = "Critical (12-20 personnel)"
+
+    return {
+        "personnel_required": total_personnel,
+        "bracket":             final_bracket,
+        "breakdown": {
+            "congestion_base":  base_personnel,
+            "emergency_bonus":  emergency_bonus,
+            "event_type_bonus": planned_bonus,
+            "scale_bonus":      scale_bonus,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Health"])
 def root():
-    return {"status": "ok", "service": "CrowdFlow AI Orchestrator v2.1"}
+    return {"status": "ok", "service": "CrowdFlow AI Orchestrator v2.2"}
 
 
 @app.get("/health", tags=["Health"])
@@ -274,26 +479,51 @@ def health():
     }
 
 
+@app.get("/event-causes", tags=["Reference"])
+def event_causes():
+    """List the valid road_block_reason values and whether each is planned/unplanned."""
+    return {"event_causes": EVENT_CAUSE_PLANNED_MAP}
+
+
 @app.post("/analyze", tags=["Analysis"])
 async def analyze(
-    file:      UploadFile = File(...,            description="Accident scene image"),
-    latitude:  float      = Form(12.9716,        description="Incident latitude (Bengaluru default)"),
-    longitude: float      = Form(77.5946,        description="Incident longitude (Bengaluru default)"),
-    zone:      str        = Form("East Zone 1",  description="Traffic zone name"),
-    corridor:  str        = Form("Non-corridor", description="Road corridor"),
-    junction:  str        = Form(None,           description="Junction name (optional)"),
+    file:               UploadFile = File(..., description="Accident scene image"),
+    road_block_reason:  str        = Form(
+        ...,
+        description=(
+            "MANDATORY — reason for the road block, e.g. 'vehicle_breakdown', "
+            "'accident', 'vip_movement', 'construction', 'public_event', "
+            "'procession', 'protest', 'pot_holes', 'water_logging', 'tree_fall', "
+            "'road_conditions', 'congestion', 'fog_low_visibility', 'debris', "
+            "'others'. See GET /event-causes for the full list. Used to derive "
+            "whether the event is planned or unplanned."
+        ),
+    ),
+    latitude:  float = Form(12.9716,        description="Incident latitude (Bengaluru default)"),
+    longitude: float = Form(77.5946,        description="Incident longitude (Bengaluru default)"),
+    zone:      str   = Form("East Zone 1",  description="Traffic zone name"),
+    corridor:  str   = Form("Non-corridor", description="Road corridor"),
+    junction:  str   = Form(None,           description="Junction name (optional)"),
 ):
     """
-    Main endpoint — upload accident image + location context.
+    Main endpoint — upload accident image + location context + mandatory
+    road block reason.
 
     Flow:
       1. YOLO object detection (sequential — feeds the rest)
-      2. Road closure + disruption called in parallel
-      3. All results merged into one dashboard-ready response
+      2. Resolve road_block_reason → canonical event_cause + planned/unplanned
+      3. Road closure + disruption called in parallel
+      4. Police personnel requirement estimated from congestion + emergency level
+      5. All results merged into one dashboard-ready response
 
     For diversion routing call the traffic routing API independently:
       POST /api/routes/local-bypass  { accident_lat, accident_lon }
     """
+    if not road_block_reason or not road_block_reason.strip():
+        raise HTTPException(status_code=422, detail="road_block_reason is mandatory")
+
+    event_cause, event_type = _resolve_event_cause(road_block_reason)
+
     image_bytes  = await file.read()
     filename     = file.filename or "upload.jpg"
     content_type = file.content_type or "image/jpeg"
@@ -313,8 +543,9 @@ async def analyze(
             )
 
         # ── Step 2: Build downstream payloads ─────────────────────────────
-        closure_payload    = _build_closure_payload(
-            analysis, latitude, longitude, zone, corridor, junction
+        closure_payload = _build_closure_payload(
+            analysis, latitude, longitude, zone, corridor, junction,
+            event_cause, event_type,
         )
         disruption_payload = _build_disruption_payload(analysis, closure_payload)
 
@@ -347,6 +578,14 @@ async def analyze(
         em_level, road_closure_req, severity_label,
         people, vehicles, congestion_score,
     )
+    police_estimate = _police_personnel_required(
+        congestion_score, em_level, event_type, vehicles, people,
+    )
+
+    nearest_station = None
+    if police_estimate["personnel_required"] >= POLICE_STATION_LOOKUP_THRESHOLD:
+        async with httpx.AsyncClient() as client:
+            nearest_station = await _find_nearest_police_station(client, latitude, longitude)
 
     # ── Step 7: Build response ─────────────────────────────────────────────
     return JSONResponse({
@@ -354,11 +593,14 @@ async def analyze(
         "timestamp": datetime.now(timezone.utc).isoformat(),
 
         "incident": {
-            "latitude":  latitude,
-            "longitude": longitude,
-            "zone":      zone,
-            "corridor":  corridor,
-            "junction":  junction,
+            "latitude":          latitude,
+            "longitude":         longitude,
+            "zone":              zone,
+            "corridor":          corridor,
+            "junction":          junction,
+            "road_block_reason": road_block_reason,
+            "event_cause":       event_cause,
+            "event_type":        event_type,
         },
 
         # Panel 1 — Detected objects
@@ -396,7 +638,16 @@ async def analyze(
             "heatmap_points": heatmap_points,
         },
 
-        # Panel 5 — Recommendations
+        # Panel 5 — Dispatch / staffing
+        "dispatch": {
+            "police_personnel_required": police_estimate["personnel_required"],
+            "personnel_bracket":         police_estimate["bracket"],
+            "personnel_breakdown":       police_estimate["breakdown"],
+            "station_lookup_threshold":  POLICE_STATION_LOOKUP_THRESHOLD,
+            "nearest_police_station":    nearest_station,
+        },
+
+        # Panel 6 — Recommendations
         "recommendations": recommendations,
 
         # Raw API responses for debugging
@@ -410,27 +661,41 @@ async def analyze(
 
 @app.post("/analyze/demo", tags=["Analysis"])
 async def analyze_demo(
-    latitude:  float = Form(12.9716),
-    longitude: float = Form(77.5946),
-    zone:      str   = Form("East Zone 1"),
-    corridor:  str   = Form("ORR East 1"),
+    road_block_reason: str   = Form("accident", description="MANDATORY — reason for the road block"),
+    latitude:          float = Form(12.9716),
+    longitude:         float = Form(77.5946),
+    zone:              str   = Form("East Zone 1"),
+    corridor:          str   = Form("ORR East 1"),
 ):
     """
     Returns a realistic mocked response without calling any external APIs.
     Useful for frontend development before all services are running.
     """
+    if not road_block_reason or not road_block_reason.strip():
+        raise HTTPException(status_code=422, detail="road_block_reason is mandatory")
+
+    event_cause, event_type = _resolve_event_cause(road_block_reason)
+
     congestion_score = 0.82
     heatmap_points   = _generate_heatmap_points(latitude, longitude, congestion_score)
 
     recommendations = _generate_recommendations(
         "CRITICAL", True, "90–240 mins (Major)", 8, 3, congestion_score
     )
+    police_estimate = _police_personnel_required(
+        congestion_score, "CRITICAL", event_type, vehicles=3, people=8,
+    )
 
     return JSONResponse({
         "success":   True,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "incident":  {"latitude": latitude, "longitude": longitude,
-                      "zone": zone, "corridor": corridor, "junction": None},
+        "incident":  {
+            "latitude": latitude, "longitude": longitude,
+            "zone": zone, "corridor": corridor, "junction": None,
+            "road_block_reason": road_block_reason,
+            "event_cause":       event_cause,
+            "event_type":        event_type,
+        },
         "detected_objects": {
             "total": 11, "vehicles": 3, "people": 8,
             "road_blocks": 0, "illegal_parking": 0,
@@ -454,6 +719,25 @@ async def analyze_demo(
         },
         "map": {
             "heatmap_points": heatmap_points,
+        },
+        "dispatch": {
+            "police_personnel_required": police_estimate["personnel_required"],
+            "personnel_bracket":         police_estimate["bracket"],
+            "personnel_breakdown":       police_estimate["breakdown"],
+            "station_lookup_threshold":  POLICE_STATION_LOOKUP_THRESHOLD,
+            "nearest_police_station": (
+                {
+                    "name":               "Demo Traffic Police Station",
+                    "latitude":           latitude + 0.004,
+                    "longitude":          longitude - 0.003,
+                    "approx_distance_km": 0.52,
+                    "address":            "Demo Road, " + zone,
+                    "phone":              None,
+                    "source":             "mocked — demo mode",
+                }
+                if police_estimate["personnel_required"] >= POLICE_STATION_LOOKUP_THRESHOLD
+                else None
+            ),
         },
         "recommendations": recommendations,
         "_raw": {"note": "demo mode — no real API calls made"},
